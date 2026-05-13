@@ -50,6 +50,12 @@ swift run meeting-whisper record --title "Weekly Coaching"
 
 Press Return to stop recording. The tool then processes audio and writes an Obsidian note.
 
+For a deterministic test run that does not rely on pressing Return:
+
+```bash
+swift run meeting-whisper record --title "Test Meeting" --duration-seconds 10
+```
+
 Import an existing file:
 
 ```bash

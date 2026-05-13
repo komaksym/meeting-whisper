@@ -107,6 +107,15 @@ struct Record: AsyncParsableCommand {
     @Option(help: "Optional display name for the other participant.")
     var other: String?
 
+    @Option(help: "Automatically stop after this many seconds.")
+    var durationSeconds: Double?
+
+    mutating func validate() throws {
+        if let durationSeconds, durationSeconds <= 0 {
+            throw ValidationError("--duration-seconds must be greater than 0.")
+        }
+    }
+
     mutating func run() async throws {
         let config = try loadRequiredConfig()
         let recordingDirectory = FileManager.default.temporaryDirectory
@@ -121,20 +130,32 @@ struct Record: AsyncParsableCommand {
         }
 
         let recorder = try ScreenAudioRecorder(outputDirectory: recordingDirectory)
-        print("Recording system audio + microphone. Press Return to stop.")
         try await recorder.start()
-        _ = readLine()
+        if let durationSeconds {
+            print("Recording system audio + microphone for \(durationSeconds) seconds.")
+            try await Task.sleep(
+                nanoseconds: UInt64(durationSeconds * 1_000_000_000)
+            )
+        } else {
+            print("Recording system audio + microphone.")
+            print("Press Return in this terminal to stop.")
+            _ = readLine()
+        }
+        print("Stopping recording...")
         let artifacts = try await recorder.stop()
 
+        print("Transcribing microphone track...")
         let processor = SpeechProcessor(config: config)
         let mic = try await processor.transcribe(
             audioURL: artifacts.microphoneAudioURL,
             speaker: "Me"
         )
+        print("Transcribing system audio track...")
         let rawSystem = try await processor.transcribe(
             audioURL: artifacts.systemAudioURL,
             speaker: other ?? "Other"
         )
+        print("Diarizing system audio speakers...")
         let diarizedSystem = try await processor.diarizedTranscription(
             audioURL: artifacts.systemAudioURL,
             speakerPrefix: "Speaker"
@@ -145,6 +166,7 @@ struct Record: AsyncParsableCommand {
             diarizedSystem: diarizedSystem
         )
 
+        print("Writing Obsidian note...")
         let noteURL = try await writeNote(
             title: title,
             segments: segments,
