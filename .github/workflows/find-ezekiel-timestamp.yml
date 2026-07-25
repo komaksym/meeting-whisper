@@ -1,0 +1,61 @@
+name: Find Ezekiel timestamp
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - trigger-find-ezekiel.txt
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AUDIO_URL: https://github.com/komaksym/meeting-whisper/releases/download/ukrainian-bible-m4b-parallel-2026-07-25/ukrainian-bible-homenko-ihor-kozlov.m4b
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Read embedded chapter table
+        run: |
+          set -euxo pipefail
+          ffprobe -v error -show_chapters -of json "$AUDIO_URL" > chapters.json
+          python3 - <<'PY' | tee result.txt
+          import json
+          from pathlib import Path
+
+          chapters = json.loads(Path('chapters.json').read_text())['chapters']
+          if len(chapters) != 1189:
+              raise SystemExit(f'Unexpected chapter count: {len(chapters)}')
+
+          # 802 canonical chapters precede Ezekiel, so Ezekiel 1 is marker 803.
+          chapter = chapters[802]
+          start = float(chapter['start_time'])
+          total_seconds = round(start)
+          hours, rem = divmod(total_seconds, 3600)
+          minutes, seconds = divmod(rem, 60)
+          title = chapter.get('tags', {}).get('title', '')
+          previous = chapters[801].get('tags', {}).get('title', '')
+          next_title = chapters[803].get('tags', {}).get('title', '')
+
+          print(f'chapter_index_1_based=803')
+          print(f'start_seconds={start:.3f}')
+          print(f'timestamp={hours:02d}:{minutes:02d}:{seconds:02d}')
+          print(f'title={title}')
+          print(f'previous={previous}')
+          print(f'next={next_title}')
+          PY
+
+      - name: Report result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Ezekiel timestamp' \
+            --body "$(cat result.txt)"
