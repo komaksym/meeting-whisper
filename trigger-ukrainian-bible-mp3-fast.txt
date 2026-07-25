@@ -1,0 +1,1 @@
+Build the complete Ukrainian Bible as one verified continuous MP3 using parallel consecutive chunk encoding.
