@@ -1,0 +1,342 @@
+name: Build Ukrainian Bible M4B Fast
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - trigger-ukrainian-bible-fast.txt
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      SOURCE_URL: https://dl.bibleonline.ru/audio/ukr/bible.zip
+      OUTPUT: ukrainian-bible-homenko-ihor-kozlov.m4b
+      TAG: ukrainian-bible-m4b-parallel-2026-07-25
+    steps:
+      - name: Report runner start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Parallel Ukrainian Bible M4B build started' \
+            --body "Parallel build started in https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg unzip
+
+      - name: Download and validate source archive
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 8 --retry-all-errors \
+            --connect-timeout 30 --max-time 7200 \
+            --output bible.zip "$SOURCE_URL"
+          unzip -t bible.zip >/dev/null
+          unzip -Z1 bible.zip > zip-entries.txt
+          mkdir -p source
+          unzip -q bible.zip -d source
+
+      - name: Build canonical manifests and chapter metadata
+        run: |
+          cat > prepare.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import subprocess
+          import sys
+          from collections import OrderedDict
+          from decimal import Decimal, ROUND_HALF_UP
+          from pathlib import Path, PurePosixPath
+
+          root = Path('source').resolve()
+          lists = Path('book_lists')
+          outputs = Path('book_outputs')
+          lists.mkdir()
+          outputs.mkdir()
+
+          def natural_key(value: str):
+              return [int(p) if p.isdigit() else p.casefold()
+                      for p in re.split(r'(\d+)', value)]
+
+          def quote(path: Path) -> str:
+              return str(path).replace("'", "'\\''")
+
+          def clean(value: str) -> str:
+              value = re.sub(r'^\s*\d+[\s._-]*', '', value)
+              value = value.replace('_', ' ')
+              return re.sub(r'\s+', ' ', value).strip(' ._-')
+
+          def escape_meta(value: str) -> str:
+              value = value.replace('\\', '\\\\')
+              for char in ('=', ';', '#'):
+                  value = value.replace(char, '\\' + char)
+              return value.replace('\n', ' ').replace('\r', ' ').strip()
+
+          entries = [line.strip() for line in Path('zip-entries.txt').read_text(
+              encoding='utf-8', errors='replace').splitlines()]
+          mp3_entries = [entry for entry in entries if entry.lower().endswith('.mp3')]
+          if not mp3_entries:
+              sys.exit('No MP3 files found.')
+
+          # Preserve the publisher's directory encounter order; sort chapters naturally.
+          groups: OrderedDict[str, list[str]] = OrderedDict()
+          for entry in mp3_entries:
+              groups.setdefault(str(PurePosixPath(entry).parent), []).append(entry)
+
+          chapters = []
+          cumulative_ms = 0
+          book_jobs = []
+          encoded_concat = []
+
+          for book_index, (directory, raw_files) in enumerate(groups.items()):
+              ordered = sorted(raw_files, key=natural_key)
+              list_path = lists / f'{book_index:03d}.txt'
+              output_path = outputs / f'{book_index:03d}.m4a'
+              list_lines = []
+
+              for entry in ordered:
+                  path = root / Path(entry)
+                  if not path.is_file():
+                      sys.exit(f'Missing extracted file: {entry}')
+                  result = subprocess.run(
+                      ['ffprobe', '-v', 'error',
+                       '-show_entries', 'format=duration:format_tags=title',
+                       '-of', 'json', str(path)],
+                      check=True, text=True, capture_output=True,
+                  )
+                  data = json.loads(result.stdout)
+                  duration = Decimal(data['format']['duration'])
+                  duration_ms = int((duration * 1000).quantize(
+                      Decimal('1'), rounding=ROUND_HALF_UP))
+                  if duration_ms <= 0:
+                      sys.exit(f'Invalid duration: {entry}')
+
+                  parent = clean(PurePosixPath(entry).parent.name)
+                  stem = clean(PurePosixPath(entry).stem)
+                  title = data.get('format', {}).get('tags', {}).get('title', '').strip()
+                  title = title or f'{parent} — {stem}'
+                  start_ms = cumulative_ms
+                  end_ms = start_ms + duration_ms
+                  chapters.append({
+                      'index': len(chapters) + 1,
+                      'entry': entry,
+                      'title': title,
+                      'start_ms': start_ms,
+                      'end_ms': end_ms,
+                      'duration_ms': duration_ms,
+                  })
+                  cumulative_ms = end_ms
+                  list_lines.append(f"file '{quote(path)}'")
+
+              list_path.write_text('\n'.join(list_lines) + '\n', encoding='utf-8')
+              book_jobs.append({
+                  'index': book_index,
+                  'directory': directory,
+                  'input': str(list_path.resolve()),
+                  'output': str(output_path.resolve()),
+                  'chapters': len(ordered),
+              })
+              encoded_concat.append(f"file '{quote(output_path.resolve())}'")
+
+          total_hours = cumulative_ms / 3_600_000
+          if len(chapters) < 1000:
+              sys.exit(f'Only {len(chapters)} chapters found.')
+          if not 107 <= total_hours <= 111:
+              sys.exit(f'Unexpected total duration: {total_hours:.3f} hours')
+
+          metadata = [
+              ';FFMETADATA1',
+              'title=Українська Біблія — переклад Івана Хоменка',
+              'artist=Читає Ігор Козлов',
+              'album=Українська Аудіо Біблія',
+              'genre=Audiobook',
+              'comment=Джерело: ukrbible.at.ua / bibleonline.ru',
+          ]
+          for chapter in chapters:
+              metadata.extend([
+                  '[CHAPTER]',
+                  'TIMEBASE=1/1000',
+                  f"START={chapter['start_ms']}",
+                  f"END={chapter['end_ms']}",
+                  f"title={escape_meta(chapter['title'])}",
+              ])
+
+          Path('chapters.ffmeta').write_text(
+              '\n'.join(metadata) + '\n', encoding='utf-8')
+          Path('encoded-books.txt').write_text(
+              '\n'.join(encoded_concat) + '\n', encoding='utf-8')
+          Path('book-jobs.json').write_text(
+              json.dumps(book_jobs, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8')
+
+          manifest = {
+              'source_url': 'https://dl.bibleonline.ru/audio/ukr/bible.zip',
+              'chapter_count': len(chapters),
+              'book_group_count': len(groups),
+              'duration_ms': cumulative_ms,
+              'duration_hours': round(total_hours, 6),
+              'first_chapter': chapters[0],
+              'last_chapter': chapters[-1],
+              'book_groups': [
+                  {'directory': directory, 'chapter_files': len(files)}
+                  for directory, files in groups.items()
+              ],
+          }
+          Path('build-manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8')
+          print(json.dumps({
+              'chapter_count': len(chapters),
+              'book_group_count': len(groups),
+              'duration_hours': round(total_hours, 3),
+              'first': chapters[0]['entry'],
+              'last': chapters[-1]['entry'],
+          }, ensure_ascii=False, indent=2))
+          PY
+          python3 prepare.py
+          cat build-manifest.json
+
+      - name: Encode books concurrently
+        run: |
+          cat > encode_parallel.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          jobs = json.loads(Path('book-jobs.json').read_text(encoding='utf-8'))
+          workers = max(2, os.cpu_count() or 2)
+          print(f'Encoding {len(jobs)} book groups with {workers} workers', flush=True)
+
+          def encode(job):
+              log_path = Path(job['output']).with_suffix('.log')
+              command = [
+                  'ffmpeg', '-hide_banner', '-nostdin', '-y', '-v', 'warning',
+                  '-f', 'concat', '-safe', '0', '-i', job['input'],
+                  '-map', '0:a:0',
+                  '-c:a', 'aac', '-profile:a', 'aac_low',
+                  '-b:a', '40k', '-ar', '32000', '-ac', '1',
+                  '-movflags', '+faststart',
+                  job['output'],
+              ]
+              with log_path.open('w', encoding='utf-8') as log:
+                  subprocess.run(command, check=True, stdout=log, stderr=log)
+              return job
+
+          with ThreadPoolExecutor(max_workers=workers) as executor:
+              futures = {executor.submit(encode, job): job for job in jobs}
+              for future in as_completed(futures):
+                  job = futures[future]
+                  try:
+                      done = future.result()
+                  except Exception:
+                      log_path = Path(job['output']).with_suffix('.log')
+                      if log_path.exists():
+                          print(log_path.read_text(encoding='utf-8', errors='replace'))
+                      raise
+                  print(f"Encoded {done['index']:03d}: {done['directory']} ({done['chapters']} chapters)", flush=True)
+          PY
+          python3 encode_parallel.py
+          find book_outputs -type f -name '*.m4a' -printf '%f %s bytes\n' | sort
+
+      - name: Join encoded books and attach chapters
+        run: |
+          set -euxo pipefail
+          ffmpeg -hide_banner -nostdin -y -v warning \
+            -f concat -safe 0 -i encoded-books.txt \
+            -i chapters.ffmeta \
+            -map 0:a:0 -map_metadata 1 -map_chapters 1 \
+            -c:a copy \
+            -metadata title='Українська Біблія — переклад Івана Хоменка' \
+            -metadata artist='Читає Ігор Козлов' \
+            -metadata album='Українська Аудіо Біблія' \
+            -metadata genre='Audiobook' \
+            -metadata media_type=2 \
+            -movflags +faststart \
+            "$OUTPUT"
+          ls -lh "$OUTPUT"
+
+      - name: Verify output
+        run: |
+          set -euxo pipefail
+          ffprobe -v error -show_entries \
+            stream=codec_name,sample_rate,channels:format=filename,duration,size,format_name:format_tags=title,artist,album \
+            -of json "$OUTPUT" | tee output-probe.json
+          ffprobe -v error -show_chapters -of json "$OUTPUT" > output-chapters.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path('build-manifest.json').read_text())
+          probe = json.loads(Path('output-probe.json').read_text())
+          chapters = json.loads(Path('output-chapters.json').read_text())['chapters']
+          duration = float(probe['format']['duration'])
+          expected = manifest['duration_ms'] / 1000
+          streams = probe.get('streams', [])
+          if not streams or streams[0].get('codec_name') != 'aac':
+              raise SystemExit(f'Expected AAC audio stream: {streams}')
+          if abs(duration - expected) > 15:
+              raise SystemExit(f'Duration mismatch: {duration} vs {expected}')
+          if len(chapters) != manifest['chapter_count']:
+              raise SystemExit(
+                  f"Chapter mismatch: {len(chapters)} vs {manifest['chapter_count']}")
+          size = Path(probe['format']['filename']).stat().st_size
+          if size >= 2_100_000_000:
+              raise SystemExit(f'Output too large for release asset: {size}')
+          verification = {
+              'codec': streams[0].get('codec_name'),
+              'sample_rate': streams[0].get('sample_rate'),
+              'channels': streams[0].get('channels'),
+              'duration_seconds': duration,
+              'duration_hours': round(duration / 3600, 6),
+              'chapter_count': len(chapters),
+              'size_bytes': size,
+              'first_chapter': chapters[0].get('tags', {}).get('title'),
+              'last_chapter': chapters[-1].get('tags', {}).get('title'),
+          }
+          Path('verification.json').write_text(
+              json.dumps(verification, ensure_ascii=False, indent=2) + '\n')
+          print(json.dumps(verification, ensure_ascii=False, indent=2))
+          PY
+          sha256sum "$OUTPUT" | tee SHA256SUMS.txt
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" \
+            "$OUTPUT" build-manifest.json verification.json SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title 'Українська Біблія — один файл M4B' \
+            --notes "Complete Ukrainian audio Bible in one chaptered M4B file. Translation: Ivan Khomenko. Narrator: Ihor Kozlov. AAC-LC mono 32 kHz, 40 kbps. Book groups encoded concurrently and losslessly joined."
+
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Parallel Ukrainian Bible M4B ready' \
+            --body "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}\n\nDirect asset: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${OUTPUT}\n\nVerification:\n$(cat verification.json)\n\nSHA-256:\n$(cat SHA256SUMS.txt)"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Parallel Ukrainian Bible M4B build failed' \
+            --body "Build failed in https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} at commit ${GITHUB_SHA}."
