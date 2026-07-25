@@ -1,1 +1,2 @@
 Build the complete Ukrainian Bible as one chaptered M4B release asset.
+Retry with balanced parallel AAC encoding and quiet FFmpeg logs.
