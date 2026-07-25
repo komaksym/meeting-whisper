@@ -139,8 +139,15 @@ jobs:
           if not 107 <= total_hours <= 111:
               sys.exit(f'Unexpected total duration: {total_hours:.3f} hours')
 
-          Path('concat.txt').write_text(
-              '\n'.join(concat_lines) + '\n', encoding='utf-8')
+          half_ms = cumulative_ms / 2
+          split_index = min(
+              range(1, len(chapters)),
+              key=lambda i: abs(chapters[i - 1]['end_ms'] - half_ms),
+          )
+          parts = [concat_lines[:split_index], concat_lines[split_index:]]
+          for part_number, part_lines in enumerate(parts, start=1):
+              Path(f'concat-part-{part_number}.txt').write_text(
+                  '\n'.join(part_lines) + '\n', encoding='utf-8')
 
           metadata = [
               ';FFMETADATA1',
@@ -169,6 +176,13 @@ jobs:
               'duration_hours': round(total_hours, 6),
               'first_chapter': chapters[0],
               'last_chapter': chapters[-1],
+              'parallel_split': {
+                  'split_after_chapter_index': split_index,
+                  'part_1_duration_hours': round(
+                      chapters[split_index - 1]['end_ms'] / 3_600_000, 6),
+                  'part_2_duration_hours': round(
+                      (cumulative_ms - chapters[split_index - 1]['end_ms']) / 3_600_000, 6),
+              },
               'book_groups': [
                   {'directory': group, 'chapter_files': len(files)}
                   for group, files in groups.items()
@@ -181,6 +195,7 @@ jobs:
               'chapter_count': len(chapters),
               'book_group_count': len(groups),
               'duration_hours': round(total_hours, 3),
+              'split_after_chapter_index': split_index,
               'first': chapters[0]['entry'],
               'last': chapters[-1]['entry'],
           }, ensure_ascii=False, indent=2))
@@ -188,14 +203,47 @@ jobs:
           python3 prepare.py
           cat build-manifest.json
 
-      - name: Encode one chaptered M4B file
+      - name: Encode two balanced AAC halves in parallel
         run: |
-          set -euxo pipefail
-          ffmpeg -hide_banner -nostdin -y \
-            -f concat -safe 0 -i concat.txt \
+          set -euo pipefail
+
+          encode_part() {
+            local number="$1"
+            ffmpeg -hide_banner -nostdin -y -loglevel error -nostats \
+              -f concat -safe 0 -i "concat-part-${number}.txt" \
+              -map 0:a:0 \
+              -c:a aac -profile:a aac_low -b:a 40k -ar 32000 -ac 1 \
+              -map_metadata -1 \
+              "encoded-part-${number}.m4a" \
+              >"encoded-part-${number}.log" 2>&1
+          }
+
+          encode_part 1 & pid1=$!
+          encode_part 2 & pid2=$!
+
+          set +e
+          wait "$pid1"; status1=$?
+          wait "$pid2"; status2=$?
+          set -e
+
+          if [ "$status1" -ne 0 ] || [ "$status2" -ne 0 ]; then
+            echo "Part 1 status: $status1"
+            cat encoded-part-1.log || true
+            echo "Part 2 status: $status2"
+            cat encoded-part-2.log || true
+            exit 1
+          fi
+
+          ls -lh encoded-part-1.m4a encoded-part-2.m4a
+          printf "file '%s'\nfile '%s'\n" \
+            "$(pwd)/encoded-part-1.m4a" \
+            "$(pwd)/encoded-part-2.m4a" > encoded-parts.txt
+
+          ffmpeg -hide_banner -nostdin -y -loglevel error -nostats \
+            -f concat -safe 0 -i encoded-parts.txt \
             -i chapters.ffmeta \
             -map 0:a:0 -map_metadata 1 -map_chapters 1 \
-            -c:a aac -profile:a aac_low -b:a 40k -ar 32000 -ac 1 \
+            -c:a copy \
             -metadata title='Українська Біблія — переклад Івана Хоменка' \
             -metadata artist='Читає Ігор Козлов' \
             -metadata album='Українська Аудіо Біблія' \
