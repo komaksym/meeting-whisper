@@ -1,0 +1,290 @@
+name: Build Ukrainian Bible MP3 Fast
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - trigger-ukrainian-bible-mp3-fast.txt
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SOURCE_URL: https://dl.bibleonline.ru/audio/ukr/bible.zip
+      OUTPUT: ukrainian-bible-homenko-ihor-kozlov.mp3
+      TAG: ukrainian-bible-mp3-fast-2026-07-25
+    steps:
+      - name: Report runner start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Parallel Ukrainian Bible MP3 build started' \
+            --body "Parallel MP3 build started in https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg unzip
+
+      - name: Download and validate source archive
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 8 --retry-all-errors \
+            --connect-timeout 30 --max-time 7200 \
+            --output bible.zip "$SOURCE_URL"
+          unzip -t bible.zip >/dev/null
+          unzip -Z1 bible.zip > zip-entries.txt
+          mkdir -p source
+          unzip -q bible.zip -d source
+
+      - name: Build ordered balanced chunk manifests
+        run: |
+          cat > prepare_fast.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import subprocess
+          import sys
+          from collections import OrderedDict
+          from decimal import Decimal
+          from pathlib import Path, PurePosixPath
+
+          root = Path('source').resolve()
+          lists = Path('chunk_lists')
+          outputs = Path('chunk_outputs')
+          lists.mkdir()
+          outputs.mkdir()
+
+          def natural_key(value: str):
+              return [int(p) if p.isdigit() else p.casefold()
+                      for p in re.split(r'(\d+)', value)]
+
+          def quote(path: Path) -> str:
+              return str(path).replace("'", "'\\''")
+
+          entries = [line.strip() for line in Path('zip-entries.txt').read_text(
+              encoding='utf-8', errors='replace').splitlines()]
+          mp3_entries = [entry for entry in entries if entry.lower().endswith('.mp3')]
+          groups: OrderedDict[str, list[str]] = OrderedDict()
+          for entry in mp3_entries:
+              groups.setdefault(str(PurePosixPath(entry).parent), []).append(entry)
+
+          ordered = []
+          for raw_files in groups.values():
+              ordered.extend(sorted(raw_files, key=natural_key))
+          if len(ordered) != 1189:
+              sys.exit(f'Expected 1189 chapters, found {len(ordered)}')
+
+          items = []
+          total = Decimal('0')
+          for entry in ordered:
+              path = root / Path(entry)
+              if not path.is_file():
+                  sys.exit(f'Missing file: {entry}')
+              duration = Decimal(subprocess.run(
+                  ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                   '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+                  check=True, text=True, capture_output=True,
+              ).stdout.strip())
+              items.append((entry, path, duration))
+              total += duration
+
+          hours = float(total / Decimal(3600))
+          if not 107 <= hours <= 111:
+              sys.exit(f'Unexpected duration: {hours:.3f} hours')
+
+          chunk_count = 16
+          target = total / chunk_count
+          chunks = []
+          current = []
+          current_duration = Decimal('0')
+          remaining_cuts = chunk_count - 1
+          for item in items:
+              current.append(item)
+              current_duration += item[2]
+              if remaining_cuts and current_duration >= target:
+                  chunks.append(current)
+                  current = []
+                  current_duration = Decimal('0')
+                  remaining_cuts -= 1
+          if current:
+              chunks.append(current)
+          if len(chunks) != chunk_count:
+              sys.exit(f'Expected {chunk_count} chunks, produced {len(chunks)}')
+
+          jobs = []
+          encoded = []
+          for index, chunk in enumerate(chunks):
+              list_path = lists / f'{index:03d}.txt'
+              output_path = outputs / f'{index:03d}.mp3'
+              list_path.write_text(
+                  '\n'.join(f"file '{quote(path)}'" for _, path, _ in chunk) + '\n',
+                  encoding='utf-8')
+              jobs.append({
+                  'index': index,
+                  'input': str(list_path.resolve()),
+                  'output': str(output_path.resolve()),
+                  'chapters': len(chunk),
+                  'duration_seconds': float(sum((x[2] for x in chunk), Decimal('0'))),
+              })
+              encoded.append(f"file '{quote(output_path.resolve())}'")
+
+          Path('chunk-jobs.json').write_text(
+              json.dumps(jobs, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          Path('encoded-chunks.txt').write_text(
+              '\n'.join(encoded) + '\n', encoding='utf-8')
+          manifest = {
+              'source_url': 'https://dl.bibleonline.ru/audio/ukr/bible.zip',
+              'chapter_count': len(ordered),
+              'book_group_count': len(groups),
+              'chunk_count': len(chunks),
+              'duration_seconds': float(total),
+              'duration_hours': round(hours, 6),
+              'first_entry': ordered[0],
+              'last_entry': ordered[-1],
+          }
+          Path('build-manifest-mp3-fast.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          python3 prepare_fast.py
+
+      - name: Encode consecutive chunks concurrently
+        run: |
+          cat > encode_fast.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          jobs = json.loads(Path('chunk-jobs.json').read_text(encoding='utf-8'))
+          workers = max(2, os.cpu_count() or 2)
+          print(f'Encoding {len(jobs)} chunks with {workers} workers', flush=True)
+
+          def encode(job):
+              log_path = Path(job['output']).with_suffix('.log')
+              command = [
+                  'ffmpeg', '-hide_banner', '-nostdin', '-y', '-v', 'warning',
+                  '-f', 'concat', '-safe', '0', '-i', job['input'],
+                  '-map', '0:a:0',
+                  '-c:a', 'libmp3lame', '-b:a', '40k', '-ar', '32000', '-ac', '1',
+                  '-id3v2_version', '3', '-write_xing', '1',
+                  job['output'],
+              ]
+              with log_path.open('w', encoding='utf-8') as log:
+                  subprocess.run(command, check=True, stdout=log, stderr=log)
+              return job
+
+          with ThreadPoolExecutor(max_workers=workers) as executor:
+              futures = {executor.submit(encode, job): job for job in jobs}
+              for future in as_completed(futures):
+                  job = futures[future]
+                  try:
+                      done = future.result()
+                  except Exception:
+                      log_path = Path(job['output']).with_suffix('.log')
+                      if log_path.exists():
+                          print(log_path.read_text(encoding='utf-8', errors='replace'))
+                      raise
+                  print(
+                      f"Encoded chunk {done['index']:03d}: "
+                      f"{done['chapters']} chapters, {done['duration_seconds'] / 3600:.2f} h",
+                      flush=True,
+                  )
+          PY
+          python3 encode_fast.py
+          find chunk_outputs -type f -name '*.mp3' -printf '%f %s bytes\n' | sort
+
+      - name: Join encoded chunks into one MP3
+        run: |
+          set -euxo pipefail
+          ffmpeg -hide_banner -nostdin -y -v warning \
+            -f concat -safe 0 -i encoded-chunks.txt \
+            -map 0:a:0 -c:a copy \
+            -id3v2_version 3 -write_xing 1 \
+            -metadata title='Українська Біблія — переклад Івана Хоменка' \
+            -metadata artist='Читає Ігор Козлов' \
+            -metadata album='Українська Аудіо Біблія' \
+            -metadata genre='Audiobook' \
+            "$OUTPUT"
+          ls -lh "$OUTPUT"
+
+      - name: Verify output
+        run: |
+          set -euxo pipefail
+          ffprobe -v error -show_entries \
+            stream=codec_name,sample_rate,channels,bit_rate:format=filename,duration,size,format_name:format_tags=title,artist,album \
+            -of json "$OUTPUT" | tee output-probe-mp3-fast.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path('build-manifest-mp3-fast.json').read_text())
+          probe = json.loads(Path('output-probe-mp3-fast.json').read_text())
+          streams = probe.get('streams', [])
+          if not streams or streams[0].get('codec_name') != 'mp3':
+              raise SystemExit(f'Expected MP3 stream: {streams}')
+          duration = float(probe['format']['duration'])
+          expected = float(manifest['duration_seconds'])
+          if abs(duration - expected) > 30:
+              raise SystemExit(f'Duration mismatch: {duration} vs {expected}')
+          size = Path(probe['format']['filename']).stat().st_size
+          if size >= 2_100_000_000:
+              raise SystemExit(f'Output too large for release asset: {size}')
+          verification = {
+              'codec': streams[0].get('codec_name'),
+              'sample_rate': streams[0].get('sample_rate'),
+              'channels': streams[0].get('channels'),
+              'bit_rate': streams[0].get('bit_rate'),
+              'duration_seconds': duration,
+              'duration_hours': round(duration / 3600, 6),
+              'source_chapter_count': manifest['chapter_count'],
+              'encoded_chunk_count': manifest['chunk_count'],
+              'size_bytes': size,
+          }
+          Path('verification-mp3-fast.json').write_text(
+              json.dumps(verification, ensure_ascii=False, indent=2) + '\n')
+          print(json.dumps(verification, ensure_ascii=False, indent=2))
+          PY
+          sha256sum "$OUTPUT" | tee SHA256SUMS-MP3-FAST.txt
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" \
+            "$OUTPUT" build-manifest-mp3-fast.json verification-mp3-fast.json SHA256SUMS-MP3-FAST.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title 'Українська Біблія — один файл MP3' \
+            --notes "Complete Ukrainian audio Bible in one continuous MP3 file. Translation: Ivan Khomenko. Narrator: Ihor Kozlov. MP3 CBR 40 kbps, mono, 32 kHz. Canonical order from Genesis through Revelation. Consecutive chunks were encoded concurrently and joined without re-encoding."
+
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Parallel Ukrainian Bible MP3 ready' \
+            --body "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}\n\nDirect asset: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${OUTPUT}\n\nVerification:\n$(cat verification-mp3-fast.json)\n\nSHA-256:\n$(cat SHA256SUMS-MP3-FAST.txt)"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Parallel Ukrainian Bible MP3 build failed' \
+            --body "Build failed in https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} at commit ${GITHUB_SHA}."
