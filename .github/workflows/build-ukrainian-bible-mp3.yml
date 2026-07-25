@@ -1,0 +1,202 @@
+name: Build Ukrainian Bible MP3
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - trigger-ukrainian-bible-mp3.txt
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      SOURCE_URL: https://dl.bibleonline.ru/audio/ukr/bible.zip
+      OUTPUT: ukrainian-bible-homenko-ihor-kozlov.mp3
+      TAG: ukrainian-bible-mp3-2026-07-25
+    steps:
+      - name: Report runner start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Ukrainian Bible MP3 build started' \
+            --body "MP3 build started in https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg unzip
+
+      - name: Download and validate source archive
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 8 --retry-all-errors \
+            --connect-timeout 30 --max-time 7200 \
+            --output bible.zip "$SOURCE_URL"
+          unzip -t bible.zip >/dev/null
+          unzip -Z1 bible.zip > zip-entries.txt
+          mkdir -p source
+          unzip -q bible.zip -d source
+
+      - name: Build ordered chapter manifest
+        run: |
+          cat > prepare.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import subprocess
+          import sys
+          from collections import OrderedDict
+          from decimal import Decimal
+          from pathlib import Path, PurePosixPath
+
+          root = Path('source').resolve()
+
+          def natural_key(value: str):
+              return [int(p) if p.isdigit() else p.casefold()
+                      for p in re.split(r'(\d+)', value)]
+
+          def quote(path: Path) -> str:
+              return str(path).replace("'", "'\\''")
+
+          entries = [line.strip() for line in Path('zip-entries.txt').read_text(
+              encoding='utf-8', errors='replace').splitlines()]
+          mp3_entries = [entry for entry in entries if entry.lower().endswith('.mp3')]
+          if not mp3_entries:
+              sys.exit('No MP3 files found.')
+
+          groups: OrderedDict[str, list[str]] = OrderedDict()
+          for entry in mp3_entries:
+              groups.setdefault(str(PurePosixPath(entry).parent), []).append(entry)
+
+          ordered_entries: list[str] = []
+          for raw_files in groups.values():
+              ordered_entries.extend(sorted(raw_files, key=natural_key))
+
+          if len(ordered_entries) != 1189:
+              sys.exit(f'Expected 1189 chapter files, found {len(ordered_entries)}')
+
+          total_duration = Decimal('0')
+          concat_lines = []
+          for entry in ordered_entries:
+              path = root / Path(entry)
+              if not path.is_file():
+                  sys.exit(f'Missing extracted file: {entry}')
+              duration = subprocess.run(
+                  ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                   '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+                  check=True, text=True, capture_output=True,
+              ).stdout.strip()
+              total_duration += Decimal(duration)
+              concat_lines.append(f"file '{quote(path)}'")
+
+          total_hours = float(total_duration / Decimal(3600))
+          if not 107 <= total_hours <= 111:
+              sys.exit(f'Unexpected total duration: {total_hours:.3f} hours')
+
+          Path('concat.txt').write_text(
+              '\n'.join(concat_lines) + '\n', encoding='utf-8')
+          manifest = {
+              'source_url': 'https://dl.bibleonline.ru/audio/ukr/bible.zip',
+              'chapter_count': len(ordered_entries),
+              'book_group_count': len(groups),
+              'duration_seconds': float(total_duration),
+              'duration_hours': round(total_hours, 6),
+              'first_entry': ordered_entries[0],
+              'last_entry': ordered_entries[-1],
+          }
+          Path('build-manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          python3 prepare.py
+
+      - name: Encode one continuous MP3
+        run: |
+          set -euxo pipefail
+          ffmpeg -hide_banner -nostdin -y -v warning \
+            -f concat -safe 0 -i concat.txt \
+            -map 0:a:0 \
+            -c:a libmp3lame -b:a 40k -ar 32000 -ac 1 \
+            -id3v2_version 3 -write_xing 1 \
+            -metadata title='Українська Біблія — переклад Івана Хоменка' \
+            -metadata artist='Читає Ігор Козлов' \
+            -metadata album='Українська Аудіо Біблія' \
+            -metadata genre='Audiobook' \
+            "$OUTPUT"
+          ls -lh "$OUTPUT"
+
+      - name: Verify output
+        run: |
+          set -euxo pipefail
+          ffprobe -v error -show_entries \
+            stream=codec_name,sample_rate,channels,bit_rate:format=filename,duration,size,format_name:format_tags=title,artist,album \
+            -of json "$OUTPUT" | tee output-probe.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path('build-manifest.json').read_text())
+          probe = json.loads(Path('output-probe.json').read_text())
+          streams = probe.get('streams', [])
+          if not streams or streams[0].get('codec_name') != 'mp3':
+              raise SystemExit(f'Expected MP3 stream: {streams}')
+          duration = float(probe['format']['duration'])
+          expected = float(manifest['duration_seconds'])
+          if abs(duration - expected) > 20:
+              raise SystemExit(f'Duration mismatch: {duration} vs {expected}')
+          size = Path(probe['format']['filename']).stat().st_size
+          if size >= 2_100_000_000:
+              raise SystemExit(f'Output too large for release asset: {size}')
+          verification = {
+              'codec': streams[0].get('codec_name'),
+              'sample_rate': streams[0].get('sample_rate'),
+              'channels': streams[0].get('channels'),
+              'bit_rate': streams[0].get('bit_rate'),
+              'duration_seconds': duration,
+              'duration_hours': round(duration / 3600, 6),
+              'source_chapter_count': manifest['chapter_count'],
+              'size_bytes': size,
+          }
+          Path('verification-mp3.json').write_text(
+              json.dumps(verification, ensure_ascii=False, indent=2) + '\n')
+          print(json.dumps(verification, ensure_ascii=False, indent=2))
+          PY
+          sha256sum "$OUTPUT" | tee SHA256SUMS-MP3.txt
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" \
+            "$OUTPUT" build-manifest.json verification-mp3.json SHA256SUMS-MP3.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title 'Українська Біблія — один файл MP3' \
+            --notes "Complete Ukrainian audio Bible in one continuous MP3 file. Translation: Ivan Khomenko. Narrator: Ihor Kozlov. MP3 CBR 40 kbps, mono, 32 kHz. Canonical order from Genesis through Revelation."
+
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Ukrainian Bible MP3 ready' \
+            --body "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}\n\nDirect asset: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${OUTPUT}\n\nVerification:\n$(cat verification-mp3.json)\n\nSHA-256:\n$(cat SHA256SUMS-MP3.txt)"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title '[artifact] Ukrainian Bible MP3 build failed' \
+            --body "Build failed in https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} at commit ${GITHUB_SHA}."
