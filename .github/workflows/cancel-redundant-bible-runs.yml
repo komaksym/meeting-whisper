@@ -1,0 +1,24 @@
+name: Cancel redundant Bible builds
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.body == '/cancel-redundant-bible-runs'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel superseded single-stream runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run cancel 30149732022 --repo "$GITHUB_REPOSITORY" || true
+          gh run cancel 30150856103 --repo "$GITHUB_REPOSITORY" || true
